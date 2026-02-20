@@ -4,7 +4,6 @@ import scipy.signal
 
 # Force CPU Stability
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1" 
-os.environ["TORCHAUDIO_USE_BACKEND_DISPATCHER"] = "0"
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton, 
                              QFileDialog, QLabel, QTextEdit, QProgressBar, QHBoxLayout)
@@ -30,127 +29,138 @@ class ProcessingThread(QThread):
 
             encoder = VoiceEncoder(device="cpu")
 
-            # 1. PROCESS THE SINGLE REFERENCE FILE FIRST
-            self.log_signal.emit(f"🎵 Analyzing Reference: {Path(self.ref_file).name}")
+            # 1. ANALYZE REFERENCE DURATION
+            self.log_signal.emit(f"🎵 Pattern Analysis...")
             cmd_ref = f'demucs --two-stems=vocals --mp3 -o "{temp_dir}" -n htdemucs -d cpu "{self.ref_file}"'
             subprocess.run(cmd_ref, shell=True, capture_output=True)
 
             ref_name = Path(self.ref_file).stem
             ref_vocal_path = temp_dir / "htdemucs" / ref_name / "vocals.mp3"
             
-            if not ref_vocal_path.exists():
-                self.log_signal.emit("❌ Error: Could not process reference vocals.")
-                return
-
+            # GET STRICT REF DURATION (e.g., 4.5s)
             ref_duration = librosa.get_duration(path=str(ref_vocal_path))
+            self.log_signal.emit(f"📑 Reference phrase length: {ref_duration:.2f}s")
+
             wav_ref = preprocess_wav(ref_vocal_path)
             ref_embed = encoder.embed_utterance(wav_ref)
 
-            # 2. LOOP THROUGH THE FOLDER OF BIG VIDEOS
-            big_files = [f for f in os.listdir(self.big_folder) if f.lower().endswith(('.mp4', '.mov', '.mkv', '.avi'))]
+            # 2. PROCESS BIG VIDEOS
+            big_files = [f for f in os.listdir(self.big_folder) if f.lower().endswith(('.mp4', '.mov', '.mkv'))]
             
             for i, big_file in enumerate(big_files):
                 big_path = str(Path(self.big_folder) / big_file)
                 big_stem = Path(big_file).stem
-                self.log_signal.emit(f"🎬 Scanning Video: {big_file}")
+                self.log_signal.emit(f"🎬 Processing: {big_file}")
 
-                # Isolate Big File Vocals
                 cmd_big = f'demucs --two-stems=vocals --mp3 -o "{temp_dir}" -n htdemucs -d cpu "{big_path}"'
                 subprocess.run(cmd_big, shell=True, capture_output=True)
 
                 big_vocal_path = temp_dir / "htdemucs" / big_stem / "vocals.mp3"
                 if not big_vocal_path.exists(): continue
 
-                # Fingerprint the Big File
+                y_vocal, sr = librosa.load(str(big_vocal_path), sr=16000)
                 wav_big = preprocess_wav(big_vocal_path)
                 _, big_embeds, _ = encoder.embed_utterance(wav_big, return_partials=True, rate=10)
                 
-                # Match
                 scores = np.inner(ref_embed, big_embeds)
-                peaks, _ = scipy.signal.find_peaks(scores, height=0.70, distance=int(ref_duration * 10))
-
-                if len(peaks) == 0:
-                    self.log_signal.emit(f"   ⚠️ No matches in this video.")
-                    continue
-
-                self.log_signal.emit(f"   ✅ Found {len(peaks)} matches. Exporting...")
+                
+                # INNOVATION: DISTANCE LOCK
+                # We set 'distance' to roughly the length of the reference file.
+                # If ref is 4.5s, distance is 45 samples (at 10Hz).
+                # This prevents cutting the same phrase multiple times.
+                min_dist = int(ref_duration * 10 * 0.8) # 80% of ref duration
+                peaks, _ = scipy.signal.find_peaks(scores, height=0.75, distance=min_dist)
 
                 for p_idx, peak_sample in enumerate(peaks):
-                    start_time = max(0, (peak_sample * 0.1) - 0.1) # 0.1s early to avoid cut-off
-                    output_name = f"MATCH_{big_stem}_{p_idx+1}.mp4"
+                    # Initial AI Match Point
+                    raw_start = max(0, (peak_sample * 0.1) - 0.2)
+                    
+                    # --- VOICE LOWERING REFINEMENT (+/- 0.5s) ---
+                    # Look at the audio 0.5s before and after the theoretical end
+                    theo_end = raw_start + ref_duration
+                    search_start = int(max(0, theo_end - 0.5) * sr)
+                    search_end = int((theo_end + 0.5) * sr)
+                    end_window = y_vocal[search_start:search_end]
+                    
+                    # Detect where the sound actually drops in this 1-second window
+                    # This finds the "Natural Pause" near our reference time
+                    intervals = librosa.effects.split(end_window, top_db=25)
+                    if len(intervals) > 0:
+                        # Find the end of the last sound in the window
+                        refined_end_offset = intervals[-1][1] / sr
+                        final_duration = (theo_end - 0.5 - raw_start) + refined_end_offset
+                    else:
+                        final_duration = ref_duration
+
+                    # --- EXPORT ---
+                    output_name = f"DANCE_{big_stem}_{p_idx+1}.mp4"
                     output_path = os.path.join(self.out_folder, output_name)
                     
-                    # --- COMPATIBILITY-FIRST FFMPEG COMMAND ---
                     ffmpeg_cmd = [
-                        "ffmpeg", "-y",
-                        "-ss", str(start_time),
-                        "-t", str(ref_duration + 0.2),
-                        "-i", big_path,
-                        "-c:v", "libx264",        # Standard H.264
-                        "-pix_fmt", "yuv420p",    # Most compatible pixel format for Windows
-                        "-preset", "veryfast",    # Speed up encoding
-                        "-c:a", "aac",            # Standard AAC audio
-                        "-b:a", "192k",
+                        "ffmpeg", "-y", "-i", big_path,
+                        "-ss", str(raw_start),
+                        "-t", str(final_duration + 0.3), # Tiny buffer for pose completion
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+                        "-c:a", "aac", "-avoid_negative_ts", "make_zero",
                         output_path
                     ]
                     
                     subprocess.run(ffmpeg_cmd, capture_output=True)
-                
+                    self.log_signal.emit(f"      ✅ Phrase Exported: {final_duration:.2f}s")
+
                 self.progress_signal.emit(int(((i + 1) / len(big_files)) * 100))
 
-            self.finished_signal.emit("🏆 Finished! All clips are Windows-compatible.")
+            shutil.rmtree(temp_dir)
+            self.finished_signal.emit("🏆 High-Accuracy Dataset Complete!")
             
         except Exception as e:
-            self.finished_signal.emit(f"❌ CRITICAL ERROR: {str(e)}")
+            self.finished_signal.emit(f"❌ Error: {str(e)}")
 
+# (The VoiceClipperGUI class remains the same)
+
+# (GUI code remains the same as previous)
 class VoiceClipperGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI Multi-Video Matcher")
-        self.setMinimumWidth(650)
+        self.setWindowTitle("ISEF Kuchipudi Dataset Builder")
+        self.setMinimumWidth(700)
         self.ref_path = ""
         self.big_dir = ""
-        self.out_dir = os.path.join(os.getcwd(), "output")
+        self.out_dir = os.path.join(os.getcwd(), "dataset_output")
         if not os.path.exists(self.out_dir): os.makedirs(self.out_dir)
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout()
         h1, h2, h3 = QHBoxLayout(), QHBoxLayout(), QHBoxLayout()
-
-        self.lbl_ref = QLabel("<b>1.</b> Select ONE Reference File")
+        self.lbl_ref = QLabel("<b>1.</b> Reference File")
         btn_ref = QPushButton("Select File")
         btn_ref.clicked.connect(self.select_ref)
         h1.addWidget(self.lbl_ref, 1); h1.addWidget(btn_ref)
-
-        self.lbl_big = QLabel("<b>2.</b> Select Folder of Big Videos")
+        self.lbl_big = QLabel("<b>2.</b> Big Files Folder")
         btn_big = QPushButton("Select Folder")
         btn_big.clicked.connect(self.select_big)
         h2.addWidget(self.lbl_big, 1); h2.addWidget(btn_big)
-
-        self.lbl_out = QLabel(f"<b>3.</b> Saving to: /output")
-        btn_out = QPushButton("Change Destination")
+        self.lbl_out = QLabel(f"<b>3.</b> Output")
+        btn_out = QPushButton("Change")
         btn_out.clicked.connect(self.select_out)
         h3.addWidget(self.lbl_out, 1); h3.addWidget(btn_out)
-
-        self.btn_run = QPushButton("START GLOBAL SEARCH")
-        self.btn_run.setStyleSheet("background-color: #27ae60; color: white; height: 50px; font-weight: bold;")
+        self.btn_run = QPushButton("GENERATE DATASET")
+        self.btn_run.setStyleSheet("background-color: #2980b9; color: white; height: 50px; font-weight: bold;")
         self.btn_run.clicked.connect(self.start)
-
         self.pbar = QProgressBar()
         self.log = QTextEdit(); self.log.setReadOnly(True)
-        self.log.setStyleSheet("background-color: #2c3e50; color: #ecf0f1; font-family: Consolas;")
-
+        self.log.setStyleSheet("background-color: #1c1c1c; color: #00ff00; font-family: 'Courier New';")
         for item in [h1, h2, h3, self.btn_run, self.pbar, self.log]:
             if isinstance(item, QHBoxLayout): layout.addLayout(item)
             else: layout.addWidget(item)
         self.setLayout(layout)
 
     def select_ref(self):
-        self.ref_path, _ = QFileDialog.getOpenFileName(self, "Select Reference Audio/Video")
+        self.ref_path, _ = QFileDialog.getOpenFileName(self, "Select Ref")
         if self.ref_path: self.lbl_ref.setText(f"REF: {os.path.basename(self.ref_path)}")
     def select_big(self):
-        self.big_dir = QFileDialog.getExistingDirectory(self, "Select Big Videos Folder")
+        self.big_dir = QFileDialog.getExistingDirectory(self, "Select Big Files Folder")
         if self.big_dir: self.lbl_big.setText(f"FOLDER: {os.path.basename(self.big_dir)}")
     def select_out(self):
         self.out_dir = QFileDialog.getExistingDirectory(self, "Output Folder")
