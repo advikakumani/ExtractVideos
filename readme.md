@@ -17,3 +17,4 @@ pip install -r requirements.txt
 
 pip freeze > requirements.txt
 pip install demucs resemblyzer numpy soundfile librosa
+pip install fastdtw
